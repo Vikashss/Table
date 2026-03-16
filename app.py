@@ -11,8 +11,8 @@ from PIL import Image
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-st.set_page_config(page_title="Grid Table PDF to Excel", layout="wide")
-st.title("Grid Table PDF/Image to Excel")
+st.set_page_config(page_title="Hybrid PDF Table to Excel", layout="wide")
+st.title("Hybrid PDF/Image Table to Excel")
 
 uploaded_file = st.file_uploader(
     "Upload PDF or image",
@@ -46,7 +46,11 @@ def pil_to_bgr(image):
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def cluster_positions(values, tolerance=12):
+def bgr_to_rgb(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+
+def cluster_positions(values, tolerance=10):
     if not values:
         return []
 
@@ -66,10 +70,13 @@ def preprocess_for_lines(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # adaptive threshold helps on uneven scans
     bw = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 15
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        15,
     )
     return bw
 
@@ -86,7 +93,6 @@ def detect_table_regions(img_bgr):
 
     table_mask = cv2.add(horizontal, vertical)
 
-    # strengthen regions
     merge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     merged = cv2.dilate(table_mask, merge_kernel, iterations=2)
 
@@ -114,7 +120,6 @@ def detect_grid_lines(table_bgr):
     horizontal = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
     vertical = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
 
-    # find line positions from contours
     h_contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     v_contours, _ = cv2.findContours(vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -133,24 +138,48 @@ def detect_grid_lines(table_bgr):
     x_lines = cluster_positions(x_positions, tolerance=10)
     y_lines = cluster_positions(y_positions, tolerance=10)
 
-    x_lines = [x for x in x_lines if 0 <= x <= w]
-    y_lines = [y for y in y_lines if 0 <= y <= h]
+    x_lines = sorted(set([x for x in x_lines if 0 <= x <= w]))
+    y_lines = sorted(set([y for y in y_lines if 0 <= y <= h]))
 
-    # fallback: add edges if line detection missed boundary
     if len(x_lines) >= 2:
-        if x_lines[0] > 10:
+        if x_lines[0] > 8:
             x_lines = [0] + x_lines
-        if (w - x_lines[-1]) > 10:
+        if w - x_lines[-1] > 8:
             x_lines = x_lines + [w]
+
     if len(y_lines) >= 2:
-        if y_lines[0] > 10:
+        if y_lines[0] > 8:
             y_lines = [0] + y_lines
-        if (h - y_lines[-1]) > 10:
+        if h - y_lines[-1] > 8:
             y_lines = y_lines + [h]
 
-    x_lines = sorted(set(x_lines))
-    y_lines = sorted(set(y_lines))
     return x_lines, y_lines
+
+
+def draw_grid_preview(table_bgr, x_lines, y_lines):
+    preview = table_bgr.copy()
+
+    for x in x_lines:
+        cv2.line(preview, (x, 0), (x, preview.shape[0]), (0, 0, 255), 2)
+
+    for y in y_lines:
+        cv2.line(preview, (0, y), (preview.shape[1], y), (255, 0, 0), 2)
+
+    return bgr_to_rgb(preview)
+
+
+def parse_manual_lines(text):
+    if not text.strip():
+        return []
+    values = []
+    for part in text.split(","):
+        part = part.strip()
+        if part:
+            try:
+                values.append(int(part))
+            except ValueError:
+                pass
+    return sorted(set(values))
 
 
 def ocr_cell(cell_bgr):
@@ -160,22 +189,20 @@ def ocr_cell(cell_bgr):
     return clean_text(text)
 
 
-def grid_to_dataframe(table_bgr):
-    x_lines, y_lines = detect_grid_lines(table_bgr)
-
+def grid_to_dataframe(table_bgr, x_lines, y_lines):
     if len(x_lines) < 2 or len(y_lines) < 2:
         return pd.DataFrame()
 
     rows = []
     for r in range(len(y_lines) - 1):
-        row = []
         y1, y2 = y_lines[r], y_lines[r + 1]
-        if y2 - y1 < 12:
+        if y2 - y1 < 8:
             continue
 
+        row = []
         for c in range(len(x_lines) - 1):
             x1, x2 = x_lines[c], x_lines[c + 1]
-            if x2 - x1 < 12:
+            if x2 - x1 < 8:
                 row.append("")
                 continue
 
@@ -202,38 +229,23 @@ def grid_to_dataframe(table_bgr):
     df = pd.DataFrame(rows)
     df = df.loc[~df.apply(lambda r: all(clean_text(v) == "" for v in r), axis=1)]
     df = df.loc[:, ~df.apply(lambda c: all(clean_text(v) == "" for v in c), axis=0)]
-
     df = df.reset_index(drop=True)
     df.columns = [f"Column_{i+1}" for i in range(df.shape[1])]
     return df
 
 
-def extract_tables_from_image(image):
-    img_bgr = pil_to_bgr(image)
-    table_regions = detect_table_regions(img_bgr)
-
-    tables = []
-    for idx, (x, y, w, h) in enumerate(table_regions, start=1):
-        roi = img_bgr[y:y+h, x:x+w]
-        df = grid_to_dataframe(roi)
-        if not df.empty:
-            tables.append((f"Table_{idx}", df))
-
-    return tables
-
-
-def tables_to_excel_bytes(tables):
+def tables_to_excel_bytes(table_items):
     output = io.BytesIO()
-
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary = []
-        for sheet_name, df in tables:
+
+        for sheet_name, df in table_items:
             safe_sheet = sheet_name[:31]
             df.to_excel(writer, sheet_name=safe_sheet, index=False)
             summary.append({
                 "Sheet": safe_sheet,
                 "Rows": len(df),
-                "Columns": len(df.columns)
+                "Columns": len(df.columns),
             })
 
         if summary:
@@ -245,33 +257,74 @@ def tables_to_excel_bytes(tables):
 
 if uploaded_file is not None:
     try:
-        all_tables = []
-
         if uploaded_file.type == "application/pdf":
             images = pdf_to_images(uploaded_file.read(), dpi=260)
-            for page_no, image in enumerate(images, start=1):
-                page_tables = extract_tables_from_image(image)
-                for table_name, df in page_tables:
-                    all_tables.append((f"Page_{page_no}_{table_name}", df))
         else:
-            image = Image.open(uploaded_file)
-            all_tables = extract_tables_from_image(image)
+            images = [Image.open(uploaded_file)]
 
-        if not all_tables:
-            st.error("No tables detected.")
+        page_labels = [f"Page {i+1}" for i in range(len(images))]
+        selected_page_label = st.selectbox("Select page", page_labels)
+        page_index = page_labels.index(selected_page_label)
+
+        page_image = images[page_index]
+        page_bgr = pil_to_bgr(page_image)
+
+        table_regions = detect_table_regions(page_bgr)
+        if not table_regions:
+            st.error("No table region detected on this page.")
+            st.stop()
+
+        region_labels = [f"Table {i+1}" for i in range(len(table_regions))]
+        selected_region_label = st.selectbox("Select detected table", region_labels)
+        region_index = region_labels.index(selected_region_label)
+
+        x, y, w, h = table_regions[region_index]
+        table_bgr = page_bgr[y:y+h, x:x+w]
+
+        auto_x, auto_y = detect_grid_lines(table_bgr)
+
+        st.subheader("Automatic grid preview")
+        st.image(draw_grid_preview(table_bgr, auto_x, auto_y), use_container_width=True)
+
+        st.write("You can keep the auto lines, or type your own line positions in pixels.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            manual_x_text = st.text_area(
+                "Vertical lines (x positions, comma separated)",
+                value=",".join(map(str, auto_x)),
+                height=120,
+            )
+        with col2:
+            manual_y_text = st.text_area(
+                "Horizontal lines (y positions, comma separated)",
+                value=",".join(map(str, auto_y)),
+                height=120,
+            )
+
+        final_x = parse_manual_lines(manual_x_text)
+        final_y = parse_manual_lines(manual_y_text)
+
+        st.subheader("Final grid preview")
+        st.image(draw_grid_preview(table_bgr, final_x, final_y), use_container_width=True)
+
+        df = grid_to_dataframe(table_bgr, final_x, final_y)
+
+        if df.empty:
+            st.error("No cells extracted from the selected grid.")
         else:
-            st.success(f"Detected {len(all_tables)} table(s).")
+            st.success(f"Extracted {len(df)} rows and {len(df.columns)} columns.")
+            st.dataframe(df, use_container_width=True)
 
-            for name, df in all_tables:
-                with st.expander(name, expanded=False):
-                    st.dataframe(df, use_container_width=True)
+            excel_data = tables_to_excel_bytes(
+                [(f"{selected_page_label}_{selected_region_label}", df)]
+            )
 
-            excel_bytes = tables_to_excel_bytes(all_tables)
             st.download_button(
                 "Download Excel",
-                data=excel_bytes,
-                file_name="grid_tables.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                data=excel_data,
+                file_name="hybrid_table_output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
     except Exception as e:
