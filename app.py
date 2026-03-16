@@ -8,7 +8,7 @@ import pandas as pd
 import pytesseract
 import streamlit as st
 from PIL import Image
-
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 st.set_page_config(page_title="PDF Table to Excel", layout="wide")
 st.title("PDF/Image Table to Excel")
 
